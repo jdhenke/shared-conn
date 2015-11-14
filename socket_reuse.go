@@ -6,94 +6,127 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"time"
 )
 
 const (
-	defaultAddr     = ":1234"
-	defaultNumTries = 4
+	defaultAddr = ":1234"
 )
 
 var (
-	addr     string
-	numTries int
+	addr        string
+	triggerRace bool
+	ignoreFiles bool
 )
 
+func init() {
+	log.SetFlags(log.Lmicroseconds)
+}
+
 func main() {
+
 	// use flags
 	flag.StringVar(&addr, "addr", defaultAddr, "address on which to listen")
-	flag.IntVar(&numTries, "n", defaultNumTries, "number of consecutive tries")
+	flag.BoolVar(&triggerRace, "triggerRace", false, "trigger race condition")
+	flag.BoolVar(&ignoreFiles, "ignoreFiles", false, "ignore closing FDs")
 	flag.Parse()
-	log.Printf("Using address=`%v`\n", addr)
 
 	// if restart, use existing listener to try close/open again
-	if os.Getenv("IS_RESTART") == "true" {
-		file := os.NewFile(3, "")
-
-		ln, err := net.FileListener(file)
-		if err != nil {
-			log.Fatal("FileListener:", err)
-		}
-
-		// close the listener
-		err = ln.Close()
-		if err != nil {
-			log.Fatal("Close:", err)
-		}
-
-		// open it again -- "bind: address already in use" even though we just closed it...?
-		ln, err = net.Listen("tcp", addr)
-		if err != nil {
-			log.Fatalf("Child could not recreate listener: %v", err)
-		}
-
-		log.Println("CHILD PASS.")
-
-		return
+	if os.Getenv("IS_CHILD") == "true" {
+		log.SetPrefix("child  | ")
+		runChild()
+	} else {
+		log.SetPrefix("parent | ")
+		runParent()
 	}
+}
 
-	log.Printf("Will try %v times, then restart\n", numTries)
+func runParent() {
+	log.Printf("Using address=`%v`\n", addr)
 
-	// listen and close numTries times binding to addr
-	for i := 0; i < numTries; i++ {
-		listenAndClose(i)
-	}
-
+	// create fd to share
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatalf("creating ln failed in preparation for restart: %v", err)
+		log.Fatal(err)
 	}
 	lnFile, err := ln.(*net.TCPListener).File()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// sweet, no issues.
-	log.Println("PARENT PASS.")
-	log.Println("Restarting...")
-
-	os.Setenv("IS_RESTART", "true")
+	// assemble child process
+	os.Setenv("IS_CHILD", "true")
 	cmd := exec.Command(os.Args[0], os.Args[1:]...)
 	cmd.Stdin = os.Stdin   // fd 0
 	cmd.Stdout = os.Stdout // fd 1
 	cmd.Stderr = os.Stderr // fd 2
 	cmd.ExtraFiles = []*os.File{lnFile}
-	cmd.Start()
-	log.Println("Restarted.")
 
-	ln.Close() // close our copy of the listener
-	cmd.Wait()
+	// start child process
+	if err := cmd.Start(); err != nil {
+		log.Fatal(err)
+	}
+
+	// !!!RACE!!! if the child process tries to rebind before the following
+	// close operations finish, the port will still be bound.
+	if triggerRace {
+		time.Sleep(2 * time.Second)
+	}
+
+	// close our copy of the listener
+	if err := ln.Close(); err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("Closed listener.\n")
+	if !ignoreFiles {
+		if err := lnFile.Close(); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("Closed file.\n")
+	}
+
+	// TODO: signal child process it's free to rebind to avoid race condition
+
+	// wait for child to exit successfully
+	if err := cmd.Wait(); err != nil {
+		log.Fatalf("Child process error: %v\n", err)
+	}
+
+	// Victory.
+	log.Println("PASS")
+
 }
 
-// listenAndClose creates a tcp listener on addr and closes it, logging its
-// actions to and exiting the program in the event of an error.
-func listenAndClose(i int) {
-	ln, err := net.Listen("tcp", addr)
+func runChild() {
+	log.Printf("Using address=`%v`\n", addr)
+
+	// assemble shared listener
+	file := os.NewFile(3, "")
+	ln, err := net.FileListener(file)
 	if err != nil {
-		log.Fatalf("creating ln %v failed: %v\n", i, err)
+		log.Fatal("FileListener:", err)
 	}
-	log.Printf("%3d: listener created on %v\n", i, ln.Addr())
-	if err := ln.Close(); err != nil {
-		log.Fatalf("closing ln %v failed: %v\n", i, err)
+
+	// close out the original connection
+	if err = ln.Close(); err != nil {
+		log.Fatal("ln.Close:", err)
 	}
-	log.Printf("%3d: listener closed\n", i)
+	log.Printf("Closed listener.\n")
+	if !ignoreFiles {
+		if err := file.Close(); err != nil {
+			log.Fatal("file.Close:", err)
+		}
+		log.Printf("Closed file.\n")
+	}
+
+	// !!!RACE!!!; if the parent process has not closed shared stuff before the following Listen operation runs, we'll get an error.
+
+	// PROBLEMATIC REBIND
+	log.Printf("Rebinding...\n")
+	ln, err = net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("Child could not recreate listener: %v", err)
+	}
+
+	log.Println("PASS")
 }
